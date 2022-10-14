@@ -3,7 +3,7 @@ kind: Deployment
 metadata:
   name: nginx-deployment
   labels:
-    serviced: "trues"
+    serviced: "true"
     app: nginx
 spec:
   replicas: 1

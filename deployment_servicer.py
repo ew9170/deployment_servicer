@@ -3,7 +3,6 @@ import argparse
 import yaml
 import logging
 import threading
-
 from kubernetes.client import ApiException
 
 # TODO: Figure out and delete
@@ -51,18 +50,17 @@ from kubernetes.client import ApiException
 """
 
 
-def is_serviced_deployment(event: dict, label=None):
+def is_serviced_deployment(deployment: client.V1Deployment, label=None):
     """
     Helper function to determine if the event was triggered on a marked deployment
     The marker should be in .metadata.labels
-
+    :param deployment:
     :param label: the key of the annotation that we want to check for
-    :param event: event passed by the watch
     :return: bool; true if deployment has a flag
     """
     if label is None:
         label = "serviced"
-    return label in event['object'].metadata.labels
+    return label in deployment.metadata.labels
 
 
 def update_service(event: dict):
@@ -189,7 +187,7 @@ def watch_deployments(args=None):
     for event in w.stream(k8s_apps_v1.list_deployment_for_all_namespaces):
         deployment = event['object']
         if event['type'] == 'ADDED':
-            if is_serviced_deployment(event, label):
+            if is_serviced_deployment(deployment, label):
                 try:
                     create_service_with_event(event)
                 except ApiException as e:
@@ -197,7 +195,7 @@ def watch_deployments(args=None):
                                     f"may already exist")
                     continue
         if event['type'] == 'DELETED':
-            if is_serviced_deployment(event, label):
+            if is_serviced_deployment(deployment, label):
                 try:
                     delete_service_with_event(event)
                 except ApiException as e:
@@ -206,13 +204,13 @@ def watch_deployments(args=None):
                     continue
         if event['type'] == 'MODIFIED':
             try:
-                if (does_service_for_deployment_exist(deployment)) and not is_serviced_deployment(event, label):
+                if (does_service_for_deployment_exist(deployment)) and not is_serviced_deployment(deployment, label):
                     delete_service_with_event(event)
                     logging.info(f"Object modified; service for deployment \'{deployment.metadata.name}\' deleted")
-                elif (not does_service_for_deployment_exist(deployment)) and is_serviced_deployment(event, label):
+                elif (not does_service_for_deployment_exist(deployment)) and is_serviced_deployment(deployment, label):
                     create_service_with_event(event)
                     logging.info(f"Object modified; service for deployment \'{deployment.metadata.name}\' created")
-                elif does_service_for_deployment_exist(deployment) and is_serviced_deployment(event, label):
+                elif does_service_for_deployment_exist(deployment) and is_serviced_deployment(deployment, label):
                     update_service(event)
                     logging.info(f"Object modified; service for deployment \'{deployment.metadata.name}\' modified")
             except ApiException as e:
@@ -286,8 +284,10 @@ def watch_services(args=None):
             logging.info('Service deleted')
             potential_deploy_name = get_deployment_name_from_service_name(service.metadata.name)
             if does_deployment_exist(potential_deploy_name):
-                recreate_service_with_event(event)
-                logging.info("Service recreated")
+                deployment = get_deployments_from_name(potential_deploy_name).items[0]
+                if is_serviced_deployment(deployment, label):
+                    recreate_service_with_event(event)
+                    logging.info("Service successfully recreated")
 
 
 def recreate_service_with_event(event: dict):
