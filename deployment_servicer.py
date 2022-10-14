@@ -1,4 +1,4 @@
-from kubernetes import utils, client, config, watch
+from kubernetes import client, config, watch
 import argparse
 import yaml
 import logging
@@ -29,7 +29,7 @@ from kubernetes.client import ApiException
     
 4.) How do we communicate this to users?
     
-    A ReadMe.md in our directory
+    ReadMe.md in our directory
     
 5.) Labels vs Annotations
 
@@ -70,6 +70,10 @@ def update_service(event: dict):
     This function reads a modification on a deployment and attempts to update its corresponding service.
     For us, the only state worthy of note is the deployment's ports, because users have the ability to add ports to
     a deployment retroactively (metadata.name is immutable)
+
+    Unfortunately there doesn't seem to be functionality to implicitly delete ports in the Python Kubernetes-client.
+    kubectl makes use of three-way diff logic to accomplish what it does with kubectl apply -f.
+    I'm not going to bother with that.
     :param event: a modification event created by a Kubernetes watch
     :return:
     """
@@ -95,32 +99,18 @@ def update_service(event: dict):
 
     patch_body = {'spec': {'ports': ports_list}}
     k8s_core_api.patch_namespaced_service(body=patch_body, name=service_name, namespace=deployment.metadata.namespace)
-    logging.info(f'patch to {service_name}s applied')
+    logging.info(f'patch to \'{service_name}\' applied')
 
 
-def create_service_with_event(event: dict):
-    """
-    Creates a service with a deployment event;
-    This function works on deployments with pods that have multiple containers.
-
-    When creating a service manually (with a YAML document), we should specify:
-        - .metadata.name ('deploymentname_service')
-        - .spec.selector.'app.kubernetes.io/name' ('deployment_selector_name')
-        - .spec.ports[].protocol (TCP/UDP)
-        - .spec.ports[].port
-        - .spec.ports[].targetPort
-
-    :param event:
-    :return:
-    """
-    deployment_name = event['object'].metadata.name
+def create_service_from_deployment(deployment: client.V1Deployment):
+    deployment_name = deployment.metadata.name
     service_name = deployment_name + '-service'
     k8s_core_api = client.CoreV1Api()
     ports_dict = {}
     ports_list = []
 
     # for each container in this pod, look at the exposed ports and add them to a list
-    for container in event['object'].spec.template.spec.containers:
+    for container in deployment.spec.template.spec.containers:
         if container.ports is not None:
             for port in container.ports:
                 ports_dict[port.container_port] = port.protocol
@@ -128,6 +118,7 @@ def create_service_with_event(event: dict):
     # given the ports and protocols we've seen in the containers, create a V1ServicePort object for each
     for port_obj in ports_dict:
         ports_list.append(client.V1ServicePort(
+            name=str(port_obj) + '-' + str(ports_dict[port_obj]).lower(),
             port=port_obj,
             protocol=ports_dict[port_obj],  # retrieves the protocol of the port
         ))
@@ -139,12 +130,31 @@ def create_service_with_event(event: dict):
             name=service_name
         ),
         spec=client.V1ServiceSpec(
-            selector=event['object'].spec.template.metadata.labels,
+            selector=deployment.spec.template.metadata.labels,
             ports=ports_list
         )
     )
-    k8s_core_api.create_namespaced_service(namespace=event['object'].metadata.namespace, body=temp_body)
+    k8s_core_api.create_namespaced_service(namespace=deployment.metadata.namespace, body=temp_body)
     logging.info("service created")
+
+
+def create_service_with_event(event: dict):
+    """
+    Creates a service with a deployment event;
+    This function works on deployments with pods that have multiple containers.
+
+    When creating a service manually (with a YAML document), we should specify:
+        - .metadata.name ('deploymentname_service')
+        - .spec.selector.'name' ('deployment-selector_name')
+        - .spec.ports[].protocol (TCP/UDP)
+        - .spec.ports[].port
+        - .spec.ports[].targetPort
+
+    :param event:
+    :return:
+    """
+    deployment = event['object']
+    create_service_from_deployment(deployment)
 
 
 def delete_service_with_event(event: dict):
@@ -175,7 +185,7 @@ def watch_deployments(args=None):
     config.load_kube_config()
     k8s_apps_v1 = client.AppsV1Api()
     w = watch.Watch()
-
+    logging.info('Deployment watch started')
     for event in w.stream(k8s_apps_v1.list_deployment_for_all_namespaces):
         deployment = event['object']
         if event['type'] == 'ADDED':
@@ -208,7 +218,7 @@ def watch_deployments(args=None):
             except ApiException as e:
                 temp = yaml.safe_load(e.body)
                 logging.warning(f"Modification on deployment "
-                             f"\'{deployment.metadata.name}\' failed because {temp['message']}")
+                                f"\'{deployment.metadata.name}\' failed because {temp['message']}")
                 continue
 
 
@@ -233,8 +243,67 @@ def parse_args():
     return parser.parse_args()
 
 
-def watch_services():
-    pass
+def get_deployment_name_from_service_name(service_name):
+    if len(service_name) > 8:
+        return service_name[:-8]
+    else:
+        return ''
+
+
+def get_deployments_from_name(deployment_name: str):
+    config.load_kube_config()
+    k8s_core = client.AppsV1Api()
+    # get deployment name, add -service, and select for it using API call
+    deployment_list = k8s_core.list_deployment_for_all_namespaces(field_selector='metadata.name=' + deployment_name)
+    return deployment_list
+
+
+def does_deployment_exist(deployment_name: str):
+    config.load_kube_config()
+    k8s_core = client.AppsV1Api()
+    # get deployment name, add -service, and select for it using API call
+    deployment_list = k8s_core.list_deployment_for_all_namespaces(field_selector='metadata.name=' + deployment_name)
+    return len(deployment_list.items) > 0
+
+
+def watch_services(args=None):
+    """
+    This function creates a watch for deleted services and recreates them if a deployment with a corresponding
+    name and servicing label exists. This function is meant to run concurrently with watch_deployments().
+    :return: None
+    """
+    if args is not None:
+        label = args.f
+    else:
+        label = None
+    config.load_kube_config()
+    k8s_core = client.CoreV1Api()
+    w = watch.Watch()
+    logging.info('Service watch started')
+    for event in w.stream(k8s_core.list_service_for_all_namespaces):
+        service = event['object']
+        if event['type'] == 'DELETED':
+            logging.info('Service deleted')
+            potential_deploy_name = get_deployment_name_from_service_name(service.metadata.name)
+            if does_deployment_exist(potential_deploy_name):
+                recreate_service_with_event(event)
+                logging.info("Service recreated")
+
+
+def recreate_service_with_event(event: dict):
+    """
+    Given a service deletion event, this function gets the associated deployment (if it exists),
+    and recreates the service. The reason why we don't just call create_namespaced_service()
+    is because it's possible that the deployment could be out of date.
+    :param event: a service deletion event
+    :return: None
+    """
+    service_name = event['object'].metadata.name
+    deploy_name = get_deployment_name_from_service_name(service_name)
+    deployment_list = get_deployments_from_name(deploy_name)
+    if len(deployment_list.items) > 0:
+        deployment = deployment_list.items[0]
+        create_service_from_deployment(deployment)
 
 
 def configure_logging(args):
@@ -260,11 +329,12 @@ def main():
     """
     args = parse_args()
     configure_logging(args)
-    watch_deployments(args)
-    # watch_deployments_thread = threading.Thread(target=watch_deployments, args=(args,), daemon=True)
-    # watch_deployments_thread.start()
-    # watch_services_thread = None
-    # watch_deployments_thread.join()
+    watch_deployments_thread = threading.Thread(target=watch_deployments, args=(args,), daemon=True)
+    watch_services_thread = threading.Thread(target=watch_services, args=(args,), daemon=True)
+    watch_deployments_thread.start()
+    watch_services_thread.start()
+    watch_deployments_thread.join()
+    watch_services_thread.join()
 
 
 if __name__ == "__main__":
