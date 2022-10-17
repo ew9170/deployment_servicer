@@ -3,6 +3,7 @@ kind: Pod
 metadata:
   name: deployment-servicer
 spec:
+  serviceAccountName: deployment-servicer-service-account
   containers:
     - name: deployment-servicer
       image: eatonwu/deployment_servicer

@@ -1,8 +1,11 @@
+import time
+
 from kubernetes import client, config, watch
 import argparse
 import yaml
 import logging
 import threading
+import os
 from kubernetes.client import ApiException
 
 # TODO: Figure out and delete
@@ -112,6 +115,8 @@ def create_service_from_deployment(deployment: client.V1Deployment):
         if container.ports is not None:
             for port in container.ports:
                 ports_dict[port.container_port] = port.protocol
+        else:
+            raise Exception("Pod container does not contain a port")
 
     # given the ports and protocols we've seen in the containers, create a V1ServicePort object for each
     for port_obj in ports_dict:
@@ -180,7 +185,6 @@ def watch_deployments(args=None):
         label = args.f
     else:
         label = None
-    config.load_kube_config()
     k8s_apps_v1 = client.AppsV1Api()
     w = watch.Watch()
     logging.info('Deployment watch started')
@@ -194,6 +198,9 @@ def watch_deployments(args=None):
                     logging.warning(f"Creation of service for deployment \'{deployment.metadata.name}\' failed; "
                                     f"may already exist")
                     continue
+                except Exception as e:
+                    logging.warning(f"Creation of service for deployment \'{deployment.metadata.name}\' failed;"
+                                    f" {e}")
         if event['type'] == 'DELETED':
             if is_serviced_deployment(deployment, label):
                 try:
@@ -227,9 +234,6 @@ def parse_args():
                         help='Optionally change the annotation used to flag deployments for servicing.'
                              ' In the YAML, the key of the annotation match the specified annotation.'
                              ' By default, the annotation is \'serviced\'')
-    parser.add_argument('--port', type=int, help='The desired port of service, argument defaults to deployment port')
-    parser.add_argument('--target_port', type=int,
-                        help='The desired target port (the port to forward to), argument defaults to deployment port')
     parser.add_argument('-v', '--verbose', type=int, help='Used to specify the verbosity for logging.'
                                                           ' Scales from 0-4:'
                                                           '\n0: DEBUG'
@@ -249,7 +253,6 @@ def get_deployment_name_from_service_name(service_name):
 
 
 def get_deployments_from_name(deployment_name: str):
-    config.load_kube_config()
     k8s_core = client.AppsV1Api()
     # get deployment name, add -service, and select for it using API call
     deployment_list = k8s_core.list_deployment_for_all_namespaces(field_selector='metadata.name=' + deployment_name)
@@ -257,7 +260,6 @@ def get_deployments_from_name(deployment_name: str):
 
 
 def does_deployment_exist(deployment_name: str):
-    config.load_kube_config()
     k8s_core = client.AppsV1Api()
     # get deployment name, add -service, and select for it using API call
     deployment_list = k8s_core.list_deployment_for_all_namespaces(field_selector='metadata.name=' + deployment_name)
@@ -274,7 +276,6 @@ def watch_services(args=None):
         label = args.f
     else:
         label = None
-    config.load_kube_config()
     k8s_core = client.CoreV1Api()
     w = watch.Watch()
     logging.info('Service watch started')
@@ -286,8 +287,12 @@ def watch_services(args=None):
             if does_deployment_exist(potential_deploy_name):
                 deployment = get_deployments_from_name(potential_deploy_name).items[0]
                 if is_serviced_deployment(deployment, label):
-                    recreate_service_with_event(event)
-                    logging.info("Service successfully recreated")
+                    try:
+                        recreate_service_with_event(event)
+                        logging.info("Service successfully recreated")
+                    except Exception as e:
+                        logging.warning(f"Creation of service for deployment \'{deployment.metadata.name}\' failed;"
+                                        f" {e}")
 
 
 def recreate_service_with_event(event: dict):
@@ -317,10 +322,20 @@ def configure_logging(args):
     logging.info("Logging configured")
 
 
-# the goal is to watch for new deployments (with a specific flag)
-# see if deployment has an associated service
-# if so, watch for if the service(s) get destroyed, if so, create a new service
-# if not, create a new service
+def try_kube_config():
+    try:
+        try:
+            print(os.environ)
+            config.load_kube_config()
+        except:
+            print('trigger except test')
+            logging.info('kube-config not detected, attempting to load the in-cluster_config')
+            config.load_incluster_config()
+            print('passed incluster load config')
+    except config.config_exception.ConfigException as e:
+        raise Exception("Config could not be loaded")
+
+
 def main():
     """
     This controller will run on a Pod within a Kubernetes cluster.
@@ -329,8 +344,9 @@ def main():
     """
     args = parse_args()
     configure_logging(args)
-    watch_deployments_thread = threading.Thread(target=watch_deployments, args=(args,), daemon=True)
-    watch_services_thread = threading.Thread(target=watch_services, args=(args,), daemon=True)
+    try_kube_config()
+    watch_deployments_thread = threading.Thread(target=watch_deployments, args=(args,))
+    watch_services_thread = threading.Thread(target=watch_services, args=(args,))
     watch_deployments_thread.start()
     watch_services_thread.start()
     watch_deployments_thread.join()
